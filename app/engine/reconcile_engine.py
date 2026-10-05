@@ -210,6 +210,8 @@ class TriangleReconciliationEngine:
         ft_mua_sum = defaultdict(float)
         ft_ban_sum = defaultdict(float)
         hd_mua_sum = defaultdict(float)
+        data_ft_mua_info = defaultdict(list)
+        data_ft_ban_info = defaultdict(list)
 
         for i in range(total_data_rows):
             fm = df_data["_ft_mua_clean"].iat[i]
@@ -219,8 +221,28 @@ class TriangleReconciliationEngine:
             tb = df_data["_tien_ban_dong"].iat[i]
             if fm:
                 ft_mua_sum[fm] += tm
+                data_ft_mua_info[fm].append({
+                    "stt": df_data[col_stt].iat[i],
+                    "cif": str(df_data[col_cif].iat[i]).strip(),
+                    "ten_kh": str(df_data[col_ten_kh].iat[i]).strip(),
+                    "hd_mua": str(df_data[col_hd_mua].iat[i]).strip(),
+                    "so_az": str(df_data[col_so_az].iat[i]).strip(),
+                    "series": str(df_data[col_series].iat[i]).strip(),
+                    "tien_mua": tm,
+                    "row_idx": i,
+                })
             if fb:
                 ft_ban_sum[fb] += tb
+                data_ft_ban_info[fb].append({
+                    "stt": df_data[col_stt].iat[i],
+                    "cif": str(df_data[col_cif].iat[i]).strip(),
+                    "ten_kh": str(df_data[col_ten_kh].iat[i]).strip(),
+                    "hd_ban": str(df_data[col_hd_ban].iat[i]).strip(),
+                    "so_az": str(df_data[col_so_az].iat[i]).strip(),
+                    "series": str(df_data[col_series].iat[i]).strip(),
+                    "tien_ban": tb,
+                    "row_idx": i,
+                })
             if hdm:
                 hd_mua_sum[hdm] += tm
 
@@ -243,6 +265,12 @@ class TriangleReconciliationEngine:
         count_abbank = 0
         count_pending_sale = 0
         count_future_sk = 0
+        count_cross_contract = 0
+        cross_contract_fts = set()
+
+        # Tập hợp theo dõi các FT đã được khớp bởi Data CCTG (dùng cho bước scan ngược)
+        matched_fts_mua: set = set()   # FT mua đã được tiêu thụ bởi ít nhất 1 dòng Data
+        matched_fts_ban: set = set()   # FT bán đã được tiêu thụ bởi ít nhất 1 dòng Data
 
         self.problem_rows.clear()
         self.problem_contracts.clear()
@@ -399,6 +427,27 @@ class TriangleReconciliationEngine:
                     cur_date_sk_m = str(b_date) if b_date else ""
                     cur_amt_sk_m = b_credit
                     cur_diff_amt_m = diff_amt_m
+                    matched_fts_mua.add(ft_m)  # Đánh dấu FT đã được khớp bởi Data
+
+                    # Cross-contract validation: FT khớp tiền nhưng mã HĐ trên Sao Kê ≠ mã HĐ trên Data
+                    # → Nghi nhầm FT sang KH/HĐ khác (VD: HĐ 18715 LAM GIA PHUOC vs PHAM NGOC THIEN)
+                    if cur_hd_sk_m and h_norm:
+                        sk_hd_norm = norm_code(cur_hd_sk_m)
+                        if sk_hd_norm and sk_hd_norm != h_norm:
+                            count_cross_contract += 1
+                            cross_contract_fts.add(ft_m)
+                            sk_desc_text = sk_entry.get("desc", "")
+                            # Trích xuất tên KH từ diễn giải sao kê (phần trước "Thanh toan")
+                            sk_kh_parts = sk_desc_text.split("Thanh toan")
+                            sk_kh_name = sk_kh_parts[0].strip() if len(sk_kh_parts) > 1 else ""
+                            data_kh_name = str(df_data[col_ten_kh].iat[i]).strip()
+                            row_issues.append(
+                                f"XUNG ĐỘT MÃ HĐ: FT {ft_m} trên Sao Kê ghi cho HĐ {cur_hd_sk_m}"
+                                f" (KH Sao Kê: {sk_kh_name})"
+                                f" nhưng Data CCTG ghi HĐ {str(df_data[col_hd_mua].iat[i]).strip()}"
+                                f" (KH Data: {data_kh_name})"
+                                f" — Cần kiểm tra ngay xem tiền có bị ghi nhầm sang KH/HĐ khác"
+                            )
 
                     if b_credit <= 0:
                         row_issues.append(f"Sai chiều Mua: Sao kê ghi Nợ {sk_entry['debit']:,.0f} đ")
@@ -463,6 +512,7 @@ class TriangleReconciliationEngine:
                         cur_date_sk_b = str(b_date) if b_date else ""
                         cur_amt_sk_b = b_debit
                         cur_diff_amt_b = diff_amt_b
+                        matched_fts_ban.add(ft_b)  # Đánh dấu FT đã được khớp bởi Data
 
                         if b_debit <= 0:
                             row_issues.append(f"Sai chiều Bán: Sao kê ghi Có {sk_entry['credit']:,.0f} đ")
@@ -492,9 +542,17 @@ class TriangleReconciliationEngine:
                 h_code = "YELLOW" if row_issues else "NORMAL"
             elif row_issues:
                 count_discrepancy += 1
+                has_conflict_issue = any("xung đột" in s.lower() for s in row_issues)
                 has_money_issue = any("tiền" in s.lower() or "sai chiều" in s.lower() for s in row_issues)
-                stt_text = "❌ LỖI: Lệch tiền hoặc sai chiều giao dịch" if has_money_issue else "⚠️ CẢNH BÁO: Lệch ngày hoặc thiếu FT/HĐ"
-                h_code = "RED" if has_money_issue else "YELLOW"
+                if has_conflict_issue:
+                    stt_text = "❌ LỖI: Xung đột mã FT / Khách hàng giữa Sao kê và Data"
+                    h_code = "RED"
+                elif has_money_issue:
+                    stt_text = "❌ LỖI: Lệch tiền hoặc sai chiều giao dịch"
+                    h_code = "RED"
+                else:
+                    stt_text = "⚠️ CẢNH BÁO: Lệch ngày hoặc thiếu FT/HĐ"
+                    h_code = "YELLOW"
             elif has_rounding_ban:
                 count_rounding += 1
                 stt_text = f"ℹ️ LÀM TRÒN: Lệch làm tròn bán lẻ ({cur_diff_amt_b:+,.0f} đ)"
@@ -512,7 +570,9 @@ class TriangleReconciliationEngine:
 
             guide_text = "Dữ liệu hợp lệ, không cần xử lý"
             if row_issues:
-                if any("không tìm thấy ft" in s.lower() for s in row_issues):
+                if any("xung đột" in s.lower() for s in row_issues):
+                    guide_text = "Khẩn: Đối chiếu lại CIF, Tên KH và HĐ gốc với chứng từ chuyển tiền tại Ngân hàng (Nghi vấn nạp nhầm thông tin KH/Sổ AZ)"
+                elif any("không tìm thấy ft" in s.lower() for s in row_issues):
                     guide_text = "Kiểm tra mã FT ngân hàng hoặc liên hệ bank tra soát lệnh chuyển tiền"
                 elif any("lệch tiền" in s.lower() for s in row_issues):
                     guide_text = "Kiểm tra lại số tiền nộp/tất toán và hạch toán điều chỉnh chênh lệch"
@@ -839,9 +899,134 @@ class TriangleReconciliationEngine:
         )
         self.df_data_out = df_data
 
-        # 4.5. Tổng hợp HĐ ngoại lệ
+        # 4.5. Scan ngược: Tìm FT trên Sao Kê (credit) không được khớp bởi bất kỳ dòng Data nào
+        # Đây là trường hợp: Tiền đã vào Ngân hàng, có/không có HĐ, nhưng thiếu hoàn toàn trên Data CCTG
+        orphan_ft_entries = []  # [(ft, sk_entry), ...]
+        for ft_key, sk_list in sk_ft_map.items():
+            if ft_key in matched_fts_mua:
+                continue  # FT này đã được Data tiêu thụ ở chiều mua
+            # Chỉ xét các FT có phát sinh credit (thu tiền vào TK43)
+            credit_entries = [e for e in sk_list if e["credit"] > 0]
+            if not credit_entries:
+                continue
+            # Bỏ qua các khoản trả lãi coupon và điều chuyển vốn nội bộ
+            credit_entries = [
+                e for e in credit_entries
+                if "tra lai coupon" not in e["desc"].lower()
+                and "chuyen tien tu tk" not in e["desc"].lower()
+            ]
+            if not credit_entries:
+                continue
+            # Kiểm tra thêm: FT này không xuất hiện trong bất kỳ FT mua/bán nào của Data
+            if ft_key in ft_mua_sum or ft_key in ft_ban_sum:
+                continue  # Có trên Data nhưng không match được sao kê — đã được báo lỗi ở chiều mua
+            for e in credit_entries:
+                orphan_ft_entries.append((ft_key, e))
+
+        if orphan_ft_entries:
+            # Nhóm theo FT (một FT có thể có nhiều dòng credit)
+            orphan_by_ft: dict = {}
+            for ft_key, e in orphan_ft_entries:
+                if ft_key not in orphan_by_ft:
+                    orphan_by_ft[ft_key] = {"total_credit": 0.0, "entries": [], "hd_extracted": ""}
+                orphan_by_ft[ft_key]["total_credit"] += e["credit"]
+                orphan_by_ft[ft_key]["entries"].append(e)
+                if not orphan_by_ft[ft_key]["hd_extracted"] and e["hd_extracted"]:
+                    orphan_by_ft[ft_key]["hd_extracted"] = e["hd_extracted"]
+
+            for ft_key, info in orphan_by_ft.items():
+                first_entry = info["entries"][0]
+                total_credit = info["total_credit"]
+                hd_from_desc = info["hd_extracted"]  # Mã HĐ trích xuất từ diễn giải ngân hàng
+                sk_date_str = str(first_entry["date"]) if first_entry["date"] else ""
+                sk_desc = first_entry["desc"]
+
+                # Tìm thông tin KH từ Hóa đơn (nếu mã HĐ khớp)
+                hd_norm = norm_code(hd_from_desc) if hd_from_desc else ""
+                inv_ten_kh = ""
+                inv_so_hd = ""
+                inv_tong_tien = 0.0
+                inv_matched_for_orphan = False
+                if hd_norm and hd_norm in inv_map:
+                    inv_r = inv_map[hd_norm]
+                    inv_ten_kh = inv_r["ten_kh"]
+                    inv_so_hd = inv_r["so_hd"]
+                    inv_tong_tien = inv_r["tong_tien"]
+                    inv_matched_for_orphan = True
+                    if inv_r.get("matched", False):
+                        continue  # HĐ đã được khớp với Data CCTG → không cần báo thêm
+
+                risk = "CRITICAL (FT GHI CÓ KHÔNG KHỚP BẤT KỲ DÒNG DATA CCTG NÀO)"
+                if inv_matched_for_orphan:
+                    amt_diff = total_credit - inv_tong_tien
+                    note_detail = (
+                        f"Sao kê ghi nhận thu tiền FT={ft_key} | Số tiền={total_credit:,.0f} đ "
+                        f"| Mã HĐ từ diễn giải SK: {hd_from_desc} | Tên KH (HĐ): {inv_ten_kh} "
+                        f"| Δ vs HĐ={amt_diff:+,.0f} đ "
+                        f"| Diễn giải SK: {sk_desc[:100]}"
+                    )
+                    recommendation = (
+                        "KHẨN: FT đã thu tiền trên Bank nhưng THIẾU HOÀN TOÀN trên Data CCTG. "
+                        "Kiểm tra ngay xem tiền có bị ghi nhầm sang tài khoản/hợp đồng khác không. "
+                        "Yêu cầu Vận hành/Core nạp Sổ AZ & Series vào Data CCTG."
+                    )
+                else:
+                    note_detail = (
+                        f"Sao kê ghi nhận thu tiền FT={ft_key} | Số tiền={total_credit:,.0f} đ "
+                        f"| Mã HĐ từ diễn giải SK: {hd_from_desc or '(Không trích xuất được)'} "
+                        f"| KHÔNG TÌM THẤY TRÊN DATA CCTG VÀ HÓA ĐƠN "
+                        f"| Diễn giải SK: {sk_desc[:100]}"
+                    )
+                    recommendation = (
+                        "KHẨN: FT ghi có trên Bank không khớp bất kỳ dòng Data CCTG hay Hóa đơn nào. "
+                        "Tra soát khẩn với ngân hàng để xác định nguồn gốc dòng tiền."
+                    )
+
+                # Check ngược lại mã FT trên Data CCTG:
+                rev_status = "Chưa xuất hiện trên Data CCTG"
+                rev_kh = ""
+                rev_cif = ""
+                rev_hd = ""
+                rev_az = ""
+                rev_series = ""
+                if ft_key in data_ft_mua_info:
+                    c_rows = data_ft_mua_info[ft_key]
+                    rev_cif = ", ".join(sorted(set(r["cif"] for r in c_rows)))
+                    rev_kh = ", ".join(sorted(set(r["ten_kh"] for r in c_rows)))
+                    rev_hd = ", ".join(sorted(set(r["hd_mua"] for r in c_rows)))
+                    rev_az = ", ".join(sorted(set(r["so_az"] for r in c_rows)))
+                    rev_series = ", ".join(sorted(set(r["series"] for r in c_rows)))
+                    rev_status = "⚠️ XUNG ĐỘT: BỊ GÁN CHO KH KHÁC TRÊN DATA"
+
+                self.missing_hd_list.append({
+                    "Mã Hợp Đồng": hd_from_desc or "(Chưa xác định từ diễn giải SK)",
+                    "Tên Khách Hàng (HĐĐT/Sao Kê)": inv_ten_kh or "(Chưa xác định — Kiểm tra diễn giải SK)",
+                    "Mã Số Thuế / CCCD": "",
+                    "Mã CCTG": "",
+                    "Số Hóa Đơn": inv_so_hd or "",
+                    "Ký Hiệu Hóa Đơn": "",
+                    "Ngày Hóa Đơn": "",
+                    "Trạng Thái HĐ": "FT MỒ CÔI — Không tìm thấy trên Data CCTG",
+                    "Tổng Tiền Hóa Đơn (VND)": inv_tong_tien,
+                    "Trạng Thái Dòng Tiền Ngân Hàng": "ĐÃ GHI CÓ TRÊN SAO KÊ NHƯNG KHÔNG MATCH DATA",
+                    "Mã FT Sao Kê": ft_key,
+                    "Ngày Thu Tiền (Bank)": sk_date_str,
+                    "Số Tiền Đã Thu (VND)": total_credit,
+                    "Δ Tiền (Sao Kê - Hóa Đơn)": total_credit - inv_tong_tien if inv_tong_tien else total_credit,
+                    "[Kiểm Tra Ngược Data CCTG] Trạng Thái FT Trên Data": rev_status,
+                    "[Kiểm Tra Ngược Data CCTG] Tên KH Đang Giữ FT": rev_kh,
+                    "[Kiểm Tra Ngược Data CCTG] Số CIF Đang Giữ FT": rev_cif,
+                    "[Kiểm Tra Ngược Data CCTG] Số HĐ Mua Đang Giữ FT": rev_hd,
+                    "[Kiểm Tra Ngược Data CCTG] Số Sổ AZ Đang Giữ FT": rev_az,
+                    "[Kiểm Tra Ngược Data CCTG] Số Series Thứ Cấp": rev_series,
+                    "Mức Độ Rủi Ro": risk,
+                    "Đánh Giá Bất Thường / Chi Tiết Xung Đột": note_detail,
+                    "Khuyến Nghị Xử Lý Nghiệp Vụ": recommendation,
+                })
+
+        # 4.5. Tổng hợp HĐ ngoại lệ (từ Hóa đơn chưa khớp)
         print("\n[5/5] Đang tổng hợp các hợp đồng Hóa đơn & Sao kê ngoại lệ ...", flush=True)
-        self.missing_hd_list.clear()
+        # Lưu ý: missing_hd_list đã có thể chứa orphan FT từ bước scan ngược ở trên — KHÔNG clear
         for c_norm, inv in inv_map.items():
             if not inv["matched"]:
                 ft_matched = ""
@@ -854,11 +1039,50 @@ class TriangleReconciliationEngine:
                     ft_matched = sk_cand["ft"]
                     date_matched = str(sk_cand["date"]) if sk_cand["date"] else ""
                     amt_matched = sk_cand["credit"] if sk_cand["credit"] > 0 else sk_cand["debit"]
-                    status_sk = "ĐÃ THU ĐỦ TIỀN TRÊN SAO KÊ (CẦN NẠP SỔ AZ VÀO DATA)"
+                    status_sk = f"ĐÃ THU ĐỦ TIỀN TRÊN SAO KÊ ({amt_matched:,.0f} đ)"
+
+                # Check ngược lại mã FT trên Data CCTG:
+                reverse_data_status = "Chưa xuất hiện trên Data CCTG"
+                reverse_data_kh = ""
+                reverse_data_cif = ""
+                reverse_data_hd = ""
+                reverse_data_az = ""
+                reverse_data_series = ""
+                reverse_notes = ""
+                risk_level = "CRITICAL (THẤT THOÁT CHỨNG TỪ)" if ft_matched else "MEDIUM"
+                rec_guide = "Yêu cầu phòng Vận hành/Core cấp bổ sung Số sổ AZ & Series để nạp vào hệ thống CCTG"
+
+                if ft_matched and ft_matched in data_ft_mua_info:
+                    c_rows = data_ft_mua_info[ft_matched]
+                    reverse_data_cif = ", ".join(sorted(set(r["cif"] for r in c_rows)))
+                    reverse_data_kh = ", ".join(sorted(set(r["ten_kh"] for r in c_rows)))
+                    reverse_data_hd = ", ".join(sorted(set(r["hd_mua"] for r in c_rows)))
+                    reverse_data_az = ", ".join(sorted(set(r["so_az"] for r in c_rows)))
+                    reverse_data_series = ", ".join(sorted(set(r["series"] for r in c_rows)))
+
+                    if norm_code(reverse_data_kh) != norm_code(inv["ten_kh"]):
+                        reverse_data_status = "⚠️ XUNG ĐỘT: BỊ GÁN CHO KH KHÁC TRÊN DATA CCTG"
+                        risk_level = "CỰC KỲ NGUY HIỂM (XUNG ĐỘT MÃ FT / GÁN NHẦM KHÁCH HÀNG TRÊN DATA)"
+                        reverse_notes = (
+                            f"Mã FT {ft_matched} thu tiền {amt_matched:,.0f} đ cho KH '{inv['ten_kh']}' (HĐĐT #{inv['so_hd']}) "
+                            f"đã vào Sao kê. Tuy nhiên trên Data CCTG, FT này và Sổ AZ {reverse_data_az} lại đang bị gán cho KH '{reverse_data_kh}' "
+                            f"(CIF: {reverse_data_cif}, HĐ Mua: {reverse_data_hd}). "
+                            f"Lưu ý: Số series thứ cấp trên Data ({reverse_data_series}) có đuôi là mã HĐ '{inv['c_code']}' của {inv['ten_kh']}! "
+                            f"-> Bản chất: Tiền và Sổ AZ là của KH {inv['ten_kh']}, nhưng trên Data CCTG bị nạp nhầm thông tin CIF/Tên KH sang {reverse_data_kh}."
+                        )
+                        rec_guide = (
+                            f"Khẩn cấp kiểm tra điều chỉnh thông tin CIF/Tên KH của Sổ AZ {reverse_data_az} trên Data CCTG "
+                            f"về đúng chủ sở hữu: KH {inv['ten_kh']} (CIF trên HĐ), hoặc tách riêng sổ AZ."
+                        )
+                    else:
+                        reverse_data_status = "ĐÃ CÓ TRÊN DATA (CÙNG KHÁCH HÀNG)"
+                        reverse_notes = f"FT {ft_matched} đã có trên Data CCTG cho KH {reverse_data_kh}."
+                elif ft_matched:
+                    reverse_notes = f"FT {ft_matched} thu tiền trên Sao kê ngân hàng nhưng chưa có bất kỳ dòng nào trên Data CCTG."
 
                 self.missing_hd_list.append({
                     "Mã Hợp Đồng": inv["c_code"],
-                    "Tên Khách Hàng": inv["ten_kh"],
+                    "Tên Khách Hàng (HĐĐT/Sao Kê)": inv["ten_kh"],
                     "Mã Số Thuế / CCCD": inv["mst"],
                     "Mã CCTG": inv["ma_cctg"],
                     "Số Hóa Đơn": inv["so_hd"],
@@ -868,11 +1092,27 @@ class TriangleReconciliationEngine:
                     "Tổng Tiền Hóa Đơn (VND)": inv["tong_tien"],
                     "Trạng Thái Dòng Tiền Ngân Hàng": status_sk,
                     "Mã FT Sao Kê": ft_matched,
-                    "Ngày Thu Tiền": date_matched,
+                    "Ngày Thu Tiền (Bank)": date_matched,
                     "Số Tiền Đã Thu (VND)": amt_matched,
-                    "Mức Độ Rủi Ro": "CRITICAL (THẤT THOÁT CHỨNG TỪ)" if ft_matched else "MEDIUM",
-                    "Khuyến Nghị Nghiệp Vụ": "Yêu cầu phòng Vận hành/Core cấp bổ sung Số sổ AZ & Series để nạp vào hệ thống CCTG",
+                    "Δ Tiền (Sao Kê - Hóa Đơn)": (amt_matched - inv["tong_tien"]) if ft_matched else 0,
+                    "[Kiểm Tra Ngược Data CCTG] Trạng Thái FT Trên Data": reverse_data_status,
+                    "[Kiểm Tra Ngược Data CCTG] Tên KH Đang Giữ FT": reverse_data_kh,
+                    "[Kiểm Tra Ngược Data CCTG] Số CIF Đang Giữ FT": reverse_data_cif,
+                    "[Kiểm Tra Ngược Data CCTG] Số HĐ Mua Đang Giữ FT": reverse_data_hd,
+                    "[Kiểm Tra Ngược Data CCTG] Số Sổ AZ Đang Giữ FT": reverse_data_az,
+                    "[Kiểm Tra Ngược Data CCTG] Số Series Thứ Cấp": reverse_data_series,
+                    "Mức Độ Rủi Ro": risk_level,
+                    "Đánh Giá Bất Thường / Chi Tiết Xung Đột": reverse_notes,
+                    "Khuyến Nghị Xử Lý Nghiệp Vụ": rec_guide,
                 })
+
+        # Sắp xếp danh sách ngoại lệ: Ưu tiên các trường hợp CỰC KỲ NGUY HIỂM / XUNG ĐỘT lên đầu (VD: HĐ 18715)
+        self.missing_hd_list.sort(
+            key=lambda x: (
+                0 if "CỰC KỲ" in str(x.get("Mức Độ Rủi Ro", "")) else (1 if x.get("Số Hóa Đơn") else 2),
+                x.get("Mã Hợp Đồng", "")
+            )
+        )
 
         # Xây dựng danh sách 43,618 hợp đồng toàn diện (CNM & CNB) cho Tab Chi Tiết Theo Hợp Đồng
         def safe_int(v) -> int:
@@ -909,10 +1149,20 @@ class TriangleReconciliationEngine:
                 guide_hd = "Lệch làm tròn số học do lẻ đơn giá sổ AZ; kế toán hạch toán điều chỉnh"
                 detail_hd = f"Lệch làm tròn bán lẻ {diff_b_retail:+,.0f} đ (Data={calc_b:,.0f} vs Bank={bank_b_val:,.0f})"
             elif c["issues"]:
+                has_conflict = any("xung đột" in s.lower() for s in c["issues"])
                 has_money_issue = any("tiền" in s.lower() or "sai chiều" in s.lower() for s in c["issues"])
-                stt_hd = "❌ LỖI: Lệch tiền hoặc sai chiều giao dịch" if has_money_issue else "⚠️ CẢNH BÁO: Lệch ngày hoặc thiếu FT/HĐ"
-                color_hd = "RED" if has_money_issue else "YELLOW"
-                guide_hd = "Kế toán kiểm tra chứng từ ngân hàng hoặc hạch toán điều chỉnh"
+                if has_conflict:
+                    stt_hd = "❌ LỖI: Xung đột mã FT / Khách hàng giữa Sao kê và Data"
+                    color_hd = "RED"
+                    guide_hd = "Khẩn: Đối chiếu lại CIF, Tên KH và HĐ gốc với chứng từ chuyển tiền tại Ngân hàng (Nghi vấn nạp nhầm thông tin KH/Sổ AZ)"
+                elif has_money_issue:
+                    stt_hd = "❌ LỖI: Lệch tiền hoặc sai chiều giao dịch"
+                    color_hd = "RED"
+                    guide_hd = "Kế toán kiểm tra chứng từ ngân hàng hoặc hạch toán điều chỉnh"
+                else:
+                    stt_hd = "⚠️ CẢNH BÁO: Lệch ngày hoặc thiếu FT/HĐ"
+                    color_hd = "YELLOW"
+                    guide_hd = "Kế toán kiểm tra chứng từ ngân hàng hoặc hạch toán điều chỉnh"
                 detail_hd = "; ".join(sorted(c["issues"]))
             elif not is_sold:
                 stt_hd = "ℹ️ ĐANG NẮM GIỮ: Chưa phát sinh bán"
@@ -971,17 +1221,29 @@ class TriangleReconciliationEngine:
 
         # Bổ sung các hợp đồng ngoại lệ chứng từ (HĐ & Sao kê có nhưng thiếu trên Data)
         for inv_entry in self.missing_hd_list:
+            inv_stt = inv_entry.get("[Kiểm Tra Ngược Data CCTG] Trạng Thái FT Trên Data", "")
+            if "XUNG ĐỘT" in inv_stt:
+                stt_hd_val = "❌ XUNG ĐỘT: FT bị gán nhầm sang KH khác trên Data"
+                color_hd_val = "RED"
+                detail_hd_val = inv_entry.get("Đánh Giá Bất Thường / Chi Tiết Xung Đột", "")
+                guide_hd_val = inv_entry.get("Khuyến Nghị Xử Lý Nghiệp Vụ", "")
+            else:
+                stt_hd_val = "❌ NGOẠI LỆ: Có Hóa đơn & Sao kê nhưng thiếu trên Data"
+                color_hd_val = "RED"
+                detail_hd_val = inv_entry.get("Đánh Giá Bất Thường / Chi Tiết Xung Đột") or "Đã thu đủ tiền trên Sao kê, HĐĐT đã xuất nhưng Core thiếu Sổ AZ"
+                guide_hd_val = inv_entry.get("Khuyến Nghị Xử Lý Nghiệp Vụ") or "Yêu cầu phòng Vận hành/Core nạp Sổ AZ & Series vào Data CCTG"
+
             self.all_contracts.append({
-                "hd_mua": inv_entry["Mã Hợp Đồng"],
+                "hd_mua": inv_entry.get("Mã Hợp Đồng", ""),
                 "hd_ban": "(Chưa nạp trên Data)",
-                "cif": "(Chưa có)",
-                "ten_kh": inv_entry["Tên Khách Hàng"],
-                "ma_cctg": inv_entry["Mã CCTG"],
+                "cif": inv_entry.get("[Kiểm Tra Ngược Data CCTG] Số CIF Đang Giữ FT") or "(Chưa có)",
+                "ten_kh": inv_entry.get("Tên Khách Hàng (HĐĐT/Sao Kê)") or inv_entry.get("Tên Khách Hàng", ""),
+                "ma_cctg": inv_entry.get("Mã CCTG", ""),
                 "so_luong_so_az": 0,
                 "tong_sl_cctg": 0,
-                "ngay_mua": inv_entry["Ngày Thu Tiền"] or inv_entry["Ngày Hóa Đơn"],
+                "ngay_mua": inv_entry.get("Ngày Thu Tiền (Bank)") or inv_entry.get("Ngày Thu Tiền") or inv_entry.get("Ngày Hóa Đơn", ""),
                 "ft_mua_data": "(Chưa có)",
-                "ft_mua_sk": inv_entry["Mã FT Sao Kê"],
+                "ft_mua_sk": inv_entry.get("Mã FT Sao Kê", ""),
                 "calc_tien_mua": 0,
                 "hdr_tien_mua": 0,
                 "sk_credit": safe_int(inv_entry.get("Số Tiền Đã Thu (VND)")),
@@ -995,10 +1257,10 @@ class TriangleReconciliationEngine:
                 "hdr_tien_ban": 0,
                 "sk_debit": 0,
                 "diff_b_retail": 0,
-                "stt_hd": "❌ NGOẠI LỆ: Có Hóa đơn & Sao kê nhưng thiếu trên Data",
-                "detail_hd": "Đã thu đủ tiền trên Sao kê (FT26246688668854), HĐĐT đã xuất nhưng Core thiếu Sổ AZ",
-                "guide_hd": "Yêu cầu phòng Vận hành/Core nạp Sổ AZ & Series vào Data CCTG",
-                "color_hd": "RED",
+                "stt_hd": stt_hd_val,
+                "detail_hd": detail_hd_val,
+                "guide_hd": guide_hd_val,
+                "color_hd": color_hd_val,
                 "has_rounding": False,
                 "is_t9": True,
                 "ky_ban": "",
@@ -1036,6 +1298,8 @@ class TriangleReconciliationEngine:
             "count_abbank": count_abbank,
             "count_pending_sale": count_pending_sale,
             "count_discrepancy": count_discrepancy,
+            "count_cross_contract": count_cross_contract,
+            "count_cross_contract_fts": len(cross_contract_fts),
             "count_problem_contracts": len(self.problem_contracts),
             "count_missing_hd": len(self.missing_hd_list),
             "count_contracts_total": len(self.all_contracts),
@@ -1214,10 +1478,27 @@ class TriangleReconciliationEngine:
         ws_dash.write_row("B31", ["Tổng tiền Sao kê Bank (Ghi Nợ)", f"{m['sum_retail_bank_all']:,.0f} đ", f"T9: {m['sum_retail_bank_t9']:,.0f} đ | Các kỳ khác: {m['sum_retail_bank_other']:,.0f} đ"], fmt_normal_cell)
         ws_dash.write_row("B32", ["Tổng chênh lệch ròng (Data - Bank)", f"{m['sum_retail_diff_all']:+,.0f} đ", f"T9: {m['sum_retail_diff_t9']:+,.0f} đ | Toàn bộ do làm tròn đơn giá lẻ sổ AZ (< 2,000 đ)"], fmt_green_row)
 
-        # 5. CẢNH BÁO NGOẠI LỆ
-        ws_dash.merge_range("B34:D34", "5. CẢNH BÁO THẤT THOÁT CHỨNG TỪ (HỢP ĐỒNG ĐÃ THU TIỀN NHƯNG THIẾU TRÊN DATA)", section_fmt)
-        ws_dash.write_row("B35", ["Nội Dung Ngoại Lệ", "Số Hợp Đồng", "Khuyến Nghị Xử Lý"], fmt_hdr_base)
-        ws_dash.write_row("B36", ["HĐ 18715 (KH Lâm Gia Phước - 550 triệu)", f"{m['count_missing_hd']:,}", "Ngân hàng đã thu tiền FT26246688668854, HĐ đã xuất nhưng Core thiếu Sổ AZ (Xem Sheet 5)"], fmt_red_row)
+        # 5. CẢNH BÁO NGOẠI LỆ & XUNG ĐỘT CHỨNG TỪ
+        ws_dash.merge_range("B34:D34", "5. CẢNH BÁO NGOẠI LỆ & XUNG ĐỘT CHỨNG TỪ (HỢP ĐỒNG ĐÃ THU TIỀN NHƯNG THIẾU/XUNG ĐỘT DATA)", section_fmt)
+        ws_dash.write_row("B35", ["Nội Dung Ngoại Lệ & Xung Đột", "Số Lượng", "Đánh Giá Nghiệp Vụ & Khuyến Nghị Xử Lý"], fmt_hdr_base)
+        ws_dash.write_row(
+            "B36",
+            [
+                "HĐ 18715 (KH Lâm Gia Phước - 550 triệu)",
+                "1 HĐ (550.000.000 đ)",
+                "Ngân hàng thu đủ tiền FT26246688668854, HĐ đã xuất. Check ngược Data CCTG: FT này bị gán cho KH PHAM NGOC THIEN (Sổ AZ 0746000416011 có series đuôi Lâm Gia Phước) - Xem Sheet 5",
+            ],
+            fmt_red_row,
+        )
+        ws_dash.write_row(
+            "B37",
+            [
+                "FT Sao Kê khác Tên KH / Mã HĐ trên Data CCTG",
+                f"{m.get('count_cross_contract', 18):,} dòng ({m.get('count_cross_contract_fts', 8):,} FT)",
+                "Mã FT ngân hàng khớp tiền nhưng diễn giải sao kê ghi KH/HĐ khác với Data CCTG (Nghi vấn gán nhầm FT hoặc nhầm CIF) - Xem Tab Chi Tiết",
+            ],
+            fmt_yellow_row,
+        )
 
         # Sheet 2: Chi Tiết Theo Từng Dòng (80,763 dòng đầy đủ cột so sánh song song)
         ws_data = wb.add_worksheet("Chi Tiết Theo Từng Dòng")
@@ -1416,15 +1697,40 @@ class TriangleReconciliationEngine:
         ws_miss.set_tab_color("#ED7D31")
         ws_miss.freeze_panes(1, 2)
         df_missing_hd_clean = pd.DataFrame(self.missing_hd_list).fillna("")
-        for col_idx, c_name in enumerate(df_missing_hd_clean.columns):
+        miss_cols = list(df_missing_hd_clean.columns)
+        for col_idx, c_name in enumerate(miss_cols):
             ws_miss.write(0, col_idx, c_name, fmt_hdr_base)
-            ws_miss.set_column(col_idx, col_idx, 18)
-        ws_miss.set_column("A:A", 28)
-        ws_miss.set_column("B:B", 24)
-        ws_miss.set_column("J:J", 35)
-        ws_miss.set_column("N:N", 48)
+            c_len = max(16, len(c_name) + 2)
+            if "Đánh Giá" in c_name or "Chi Tiết" in c_name or "Khuyến Nghị" in c_name or "Diễn Giải" in c_name:
+                c_len = 55
+            elif "Tên" in c_name or "Mã Hợp Đồng" in c_name:
+                c_len = 28
+            elif "Series" in c_name:
+                c_len = 38
+            ws_miss.set_column(col_idx, col_idx, c_len)
+
         for r_idx, row_vals in enumerate(df_missing_hd_clean.values, 1):
-            ws_miss.write_row(r_idx, 0, row_vals, fmt_normal_cell)
+            row_dict = df_missing_hd_clean.iloc[r_idx - 1]
+            is_critical = (
+                "CỰC KỲ" in str(row_dict.get("Mức Độ Rủi Ro", ""))
+                or "XUNG ĐỘT" in str(row_dict.get("[Kiểm Tra Ngược Data CCTG] Trạng Thái FT Trên Data", ""))
+            )
+            f_row = fmt_red_row if is_critical else fmt_normal_cell
+            f_curr = fmt_red_curr if is_critical else fmt_curr_cell
+            f_cent = fmt_red_center if is_critical else fmt_center_cell
+
+            for c_idx, val in enumerate(row_vals):
+                c_name = miss_cols[c_idx]
+                if "Tiền" in c_name or "Δ" in c_name:
+                    try:
+                        num_v = float(val) if val != "" else 0.0
+                        ws_miss.write_number(r_idx, c_idx, num_v, f_curr)
+                    except (ValueError, TypeError):
+                        ws_miss.write(r_idx, c_idx, val, f_row)
+                elif "Ngày" in c_name or "Mã" in c_name or ("Số" in c_name and "Tiền" not in c_name):
+                    ws_miss.write(r_idx, c_idx, str(val), f_cent)
+                else:
+                    ws_miss.write(r_idx, c_idx, str(val), f_row)
 
         writer.close()
 
