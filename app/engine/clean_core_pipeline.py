@@ -6,13 +6,14 @@ Mục tiêu:
 2. Bổ sung 4,772 số hóa đơn, ký hiệu, trạng thái từ Báo cáo Hóa đơn điện tử.
 3. Bổ sung hơn 4,000 số FT Mua bị khuyết từ Sao Kê TK43.
 4. Xử lý triệt để xung đột hợp đồng HĐ 18715 (Lâm Gia Phước CIF 13558581 vs Phạm Ngọc Thiện tại dòng 54468).
-5. Phân bổ hoàn hảo chênh lệch làm tròn bán lẻ (264 hợp đồng) vào Đơn giá bán, đảm bảo:
+5. Phân bổ hoàn hảo chênh lệch làm tròn bán lẻ (266 hợp đồng) vào Đơn giá bán, đảm bảo:
    Tổng (Số lượng * Đơn giá bán) == Tổng GT HĐ Bán == Sao Kê Ngân Hàng (100% khớp).
-6. Xuất bản 2 định dạng:
+6. Bổ sung FT Bán, Ngày bán, Tổng GT bán và chuẩn hóa trạng thái cho các GD "Lỗi thanh toán" từ Sao kê TK43.
+7. Xuất bản 2 định dạng:
    - data/output/Data_abba_Clean_Core.csv (UTF-8 BOM, 34 cột chuẩn, bảo toàn số 0 đầu)
    - data/output/Data_abba_Clean_Core.xlsx:
        + Sheet 1: Data_abba_Clean_Core (80,763 dòng sạch chuẩn để import hệ thống)
-       + Sheet 2: Chênh Lệch Bán Lẻ Đã Điều Chỉnh (264 hợp đồng có audit trail Trước vs Sau, chênh lệch = 0 đ)
+       + Sheet 2: Chênh Lệch Bán Lẻ Đã Điều Chỉnh (266 hợp đồng có audit trail Trước vs Sau, chênh lệch = 0 đ)
 """
 
 import os
@@ -21,11 +22,12 @@ import time
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import pandas as pd
 import xlsxwriter
 
+from app.exporter.excel_styles import get_cctg_excel_formats, write_cctg_data_sheet
 from app.core.config import (
     DEFAULT_DATA_PATH,
     DEFAULT_HD_PATH,
@@ -53,6 +55,7 @@ class CleanCoreDataPipeline:
             "total_rows": 0,
             "invoices_enriched": 0,
             "buy_fts_enriched": 0,
+            "sell_fts_enriched": 0,
             "lam_gia_phuoc_fixed": 0,
             "retail_contracts_adjusted": 0,
             "retail_diff_resolved": 0,
@@ -97,25 +100,44 @@ class CleanCoreDataPipeline:
                     }
             print(f"      -> Sẵn sàng đối chiếu {len(inv_map):,} hợp đồng có Hóa đơn.", flush=True)
 
-        # 3. Nạp và xây dựng bản đồ Sao Kê TK43
+        # 3. Nạp và xây dựng bản đồ Sao Kê TK43 (FT Mua & FT Bán)
         print(f"\n[3/6] Nạp dữ liệu Sao Kê TK43: {self.sk_path.name} ...", flush=True)
         sk_buy_map = {}
+        sk_sell_map = {}
         if self.sk_path.exists():
             df_sk = pd.read_excel(self.sk_path)
             for _, r in df_sk.iterrows():
                 credit = float(pd.to_numeric(r.get("Số tiền có (Credit amount)", 0), errors="coerce") or 0)
+                debit = float(pd.to_numeric(r.get("Số tiền nợ (Debit amount)", 0), errors="coerce") or 0)
+                desc = str(r.get("Diễn giải (Description)", ""))
+                ft_raw = r.get("Số giao dịch (Transaction Number)")
+                ft_clean = extract_ft(ft_raw)
+                v_date = r.get("Ngày hiệu lực (Value Date)")
+
                 if credit > 0:
-                    desc = str(r.get("Diễn giải (Description)", ""))
                     m_c = re.search(r"(CN[MB]-?\d+-\d+)", desc, re.I)
                     c_norm = norm_code(m_c.group(1)) if m_c else ""
-                    ft_raw = r.get("Số giao dịch (Transaction Number)")
-                    ft_clean = extract_ft(ft_raw)
                     if c_norm and ft_clean:
                         sk_buy_map[c_norm] = {
                             "ft": ft_clean,
                             "credit": credit,
                         }
-            print(f"      -> Sẵn sàng đối chiếu {len(sk_buy_map):,} hợp đồng có FT Mua từ ngân hàng.", flush=True)
+
+                if debit > 0:
+                    m_b = re.search(r"(CNB-?\d+-\d+)", desc, re.I)
+                    b_norm = norm_code(m_b.group(1)) if m_b else ""
+                    if b_norm and ft_clean:
+                        sk_sell_map[b_norm] = {
+                            "ft": ft_clean,
+                            "debit": debit,
+                            "date": v_date,
+                            "desc": desc,
+                        }
+            print(
+                f"      -> Sẵn sàng đối chiếu {len(sk_buy_map):,} HĐ có FT Mua và "
+                f"{len(sk_sell_map):,} HĐ có FT Bán từ ngân hàng.",
+                flush=True,
+            )
 
         # 4. Thực hiện làm sạch và chuẩn hóa dữ liệu
         print("\n[4/6] Đang tiến hành làm sạch, bù khuyết và phân bổ chênh lệch ...", flush=True)
@@ -135,30 +157,71 @@ class CleanCoreDataPipeline:
                 self.stats["lam_gia_phuoc_fixed"] += 1
             print(f"      ✔ Đã khắc phục dứt điểm xung đột HĐ 18715: Cập nhật về đúng chủ sở hữu Lâm Gia Phước (CIF 13558581).", flush=True)
 
-        # 4.2. Bổ sung Hóa đơn và FT Mua
+        # 4.2. Bổ sung Hóa đơn, FT Mua và FT Bán (Tối ưu hiệu năng bộ nhớ cao tốc)
+        col_hd_m = df["Số HĐ mua"].tolist()
+        col_so_hd = df["Số hoá đơn"].tolist()
+        col_ky_hieu = df["Ký hiệu hoá đơn"].tolist()
+        col_tt_hd = df["Trạng thái hoá đơn"].tolist()
+        col_ft_m = df["Số FT HĐ Mua"].tolist()
+        col_hd_b = df["Số HĐ Bán"].tolist()
+        col_ft_b = df["Số FT HĐ Bán"].tolist()
+        col_amt_b = df["Tổng GT HĐ Bán"].tolist()
+        col_ngay_b = df["Ngày bán"].tolist()
+        col_tt_b = df["Trạng thái GD Bán"].tolist()
+
         for i in range(len(df)):
-            hd_m = str(df["Số HĐ mua"].iat[i]).strip()
-            norm_m = norm_code(hd_m)
+            norm_m = norm_code(col_hd_m[i])
 
             # Bổ sung Hóa đơn
-            curr_so_hd = str(df["Số hoá đơn"].iat[i]).strip()
+            curr_so_hd = str(col_so_hd[i]).strip()
             if (not curr_so_hd or curr_so_hd in ("0", "nan", "None")) and norm_m in inv_map:
                 inv = inv_map[norm_m]
-                df.at[i, "Số hoá đơn"] = inv["so_hd"]
-                if not str(df["Ký hiệu hoá đơn"].iat[i]).strip():
-                    df.at[i, "Ký hiệu hoá đơn"] = inv["ky_hieu"]
-                if not str(df["Trạng thái hoá đơn"].iat[i]).strip():
-                    df.at[i, "Trạng thái hoá đơn"] = inv["trang_thai"]
+                col_so_hd[i] = inv["so_hd"]
+                if not str(col_ky_hieu[i]).strip():
+                    col_ky_hieu[i] = inv["ky_hieu"]
+                if not str(col_tt_hd[i]).strip():
+                    col_tt_hd[i] = inv["trang_thai"]
                 self.stats["invoices_enriched"] += 1
 
             # Bổ sung FT Mua
-            curr_ft_m = str(df["Số FT HĐ Mua"].iat[i]).strip()
+            curr_ft_m = str(col_ft_m[i]).strip()
             if (not curr_ft_m or curr_ft_m.lower() in ("nan", "none", "")) and norm_m in sk_buy_map:
-                df.at[i, "Số FT HĐ Mua"] = sk_buy_map[norm_m]["ft"]
+                col_ft_m[i] = sk_buy_map[norm_m]["ft"]
                 self.stats["buy_fts_enriched"] += 1
+
+            # Bổ sung FT Bán, Ngày bán, Tổng GT HĐ Bán và cập nhật Trạng thái cho GD "Lỗi thanh toán"
+            curr_tt = str(col_tt_b[i]).strip()
+            if "lỗi thanh toán" in curr_tt.lower():
+                norm_b = norm_code(col_hd_b[i])
+                if norm_b in sk_sell_map:
+                    sell_info = sk_sell_map[norm_b]
+                    col_ft_b[i] = sell_info["ft"]
+                    col_amt_b[i] = str(int(round(sell_info["debit"])))
+                    d_val = sell_info["date"]
+                    if pd.notnull(d_val):
+                        if hasattr(d_val, "strftime"):
+                            col_ngay_b[i] = f"{d_val.month}/{d_val.day}/{d_val.year} 12:00:00 AM"
+                        else:
+                            col_ngay_b[i] = str(d_val)
+                    col_tt_b[i] = "Thành công"
+                    self.stats["sell_fts_enriched"] += 1
+
+        df["Số hoá đơn"] = col_so_hd
+        df["Ký hiệu hoá đơn"] = col_ky_hieu
+        df["Trạng thái hoá đơn"] = col_tt_hd
+        df["Số FT HĐ Mua"] = col_ft_m
+        df["Số FT HĐ Bán"] = col_ft_b
+        df["Tổng GT HĐ Bán"] = col_amt_b
+        df["Ngày bán"] = col_ngay_b
+        df["Trạng thái GD Bán"] = col_tt_b
 
         print(f"      ✔ Đã bổ sung thành công {self.stats['invoices_enriched']:,} dòng thông tin Hóa đơn.", flush=True)
         print(f"      ✔ Đã bổ sung thành công {self.stats['buy_fts_enriched']:,} dòng Số FT HĐ Mua.", flush=True)
+        print(
+            f"      ✔ Đã bổ sung trọn bộ {self.stats['sell_fts_enriched']:,} dòng GD Bán 'Lỗi thanh toán' "
+            f"(Mã FT, Ngày bán, Tổng GT bán, Trạng thái Thành công).",
+            flush=True,
+        )
 
         # 4.3. Phân bổ chênh lệch làm tròn bán lẻ (Retail Rounding Allocation)
         print("      Đang tối ưu & phân bổ chênh lệch làm tròn cho các hợp đồng bán lẻ ...", flush=True)
@@ -170,7 +233,6 @@ class CleanCoreDataPipeline:
             contracts_sold[hdb].append(idx)
 
         for hdb, idx_list in contracts_sold.items():
-            # Lấy header bán
             hdr_str = str(df["Tổng GT HĐ Bán"].loc[idx_list[0]]).replace(",", "").strip()
             try:
                 hdr_val = float(hdr_str)
@@ -180,7 +242,6 @@ class CleanCoreDataPipeline:
             if hdr_val <= 0:
                 continue
 
-            # Tính tổng các dòng ban đầu
             sl_list = []
             dg_list = []
             for r_idx in idx_list:
@@ -192,14 +253,11 @@ class CleanCoreDataPipeline:
             calc_sum = sum(s * d for s, d in zip(sl_list, dg_list))
             diff = hdr_val - calc_sum
 
-            # Nếu có lệch làm tròn (nhỏ hơn dung sai 2,000 đ)
             if abs(diff) >= 0.001 and abs(diff) < 2000.0:
                 self.stats["retail_contracts_adjusted"] += 1
                 diff_int = int(round(diff))
                 method_note = ""
 
-                # Thuật toán phân bổ:
-                # Bước 1: Ưu tiên dòng có SL == 1
                 adjusted = False
                 for i_pos, r_idx in enumerate(idx_list):
                     if sl_list[i_pos] == 1.0:
@@ -213,7 +271,6 @@ class CleanCoreDataPipeline:
                         method_note = f"Phân bổ {diff:+,.0f} đ vào Sổ AZ {so_az_curr} (dòng SL=1)"
                         break
 
-                # Bước 2: Dòng có SL chia hết cho diff_int
                 if not adjusted and diff_int != 0:
                     for i_pos, r_idx in enumerate(idx_list):
                         s_int = int(sl_list[i_pos])
@@ -226,7 +283,6 @@ class CleanCoreDataPipeline:
                             method_note = f"Phân bổ {step:+,.0f} đ/sổ vào Sổ AZ {so_az_curr} (dòng SL={s_int})"
                             break
 
-                # Bước 3: Diophantine nguyên 2 ẩn cho các cặp dòng phổ biến
                 if not adjusted and diff_int != 0 and len(idx_list) >= 2:
                     found_dioph = False
                     for i_a in range(len(idx_list)):
@@ -252,7 +308,6 @@ class CleanCoreDataPipeline:
                         if found_dioph:
                             break
 
-                # Bước 4: Nếu không có tổ hợp nguyên nhỏ, chia đều hoặc phân bổ số thập phân chính xác vào dòng có SL nhỏ nhất
                 if not adjusted:
                     min_pos = min(range(len(idx_list)), key=lambda k: sl_list[k] if sl_list[k] > 0 else 999999)
                     r_idx = idx_list[min_pos]
@@ -266,7 +321,6 @@ class CleanCoreDataPipeline:
 
                 self.stats["retail_diff_resolved"] += 1
 
-                # Tính lại tổng sau điều chỉnh để audit trail
                 calc_new = 0.0
                 for r_idx in idx_list:
                     s_v = float(str(df["Số lượng"].loc[r_idx]).replace(",", "").strip() or 0)
@@ -294,7 +348,6 @@ class CleanCoreDataPipeline:
                     "d_ban_parsed": d_ban_parsed,
                 })
 
-        # Sắp xếp danh sách audit trail: Ưu tiên 230 hợp đồng Tháng 9 lên đầu
         self.retail_audit_records.sort(
             key=lambda x: (
                 0 if x["d_ban_parsed"] and x["d_ban_parsed"].month == 9 and x["d_ban_parsed"].year == 2026 else 1,
@@ -307,7 +360,6 @@ class CleanCoreDataPipeline:
 
         # 5. Xuất bản tệp CSV chuẩn UTF-8 có BOM cho Core Data
         print(f"\n[5/6] Đang xuất tệp CSV sạch cho CD CORE DATA: {OUTPUT_CLEAN_CSV.name} ...", flush=True)
-        # Đảm bảo giữ đúng 34 cột nguyên bản và thứ tự cột
         df_clean = df[original_cols]
         df_clean.to_csv(OUTPUT_CLEAN_CSV, index=False, encoding="utf-8-sig")
         csv_size_mb = os.path.getsize(OUTPUT_CLEAN_CSV) / (1024 * 1024)
@@ -323,195 +375,42 @@ class CleanCoreDataPipeline:
         print(f"  - Tổng số dòng dữ liệu: {self.stats['total_rows']:,}")
         print(f"  - Số dòng bổ sung Hóa Đơn: {self.stats['invoices_enriched']:,}")
         print(f"  - Số dòng bổ sung FT Mua: {self.stats['buy_fts_enriched']:,}")
+        print(f"  - Số dòng bổ sung FT Bán (từ Lỗi thanh toán): {self.stats['sell_fts_enriched']:,}")
         print(f"  - Số bản ghi xử lý Lâm Gia Phước (HĐ 18715): {self.stats['lam_gia_phuoc_fixed']}")
         print(f"  - Số HĐ bán lẻ phân bổ làm tròn: {self.stats['retail_contracts_adjusted']}")
         print(f"  - File CSV Core: {OUTPUT_CLEAN_CSV}")
         print(f"  - File Excel Core: {OUTPUT_CLEAN_XLSX}")
-        print(f"    -> Sheet 1: Data_abba_Clean_Core (80,763 dòng sạch chuẩn import)")
-        print(f"    -> Sheet 2: Chênh Lệch Bán Lẻ Đã Điều Chỉnh (264 HĐ audit trail Trước vs Sau = 0 đ)")
+        print(f"    -> Sheet 1: Data_abba_Clean_Core ({len(df_clean):,} dòng sạch chuẩn import)")
+        print(f"    -> Sheet 2: Chênh Lệch Bán Lẻ Đã Điều Chỉnh ({len(self.retail_audit_records)} HĐ audit trail Trước vs Sau = 0 đ)")
         print(f"  - Tổng thời gian xử lý: {elapsed:.1f} giây")
         print("=" * 80 + "\n", flush=True)
         return True
 
     def _export_to_excel(self, df: pd.DataFrame, out_path: Path):
         workbook = xlsxwriter.Workbook(out_path, {"constant_memory": True})
+        font_family = "Arial"
+        formats = get_cctg_excel_formats(workbook, font_family=font_family)
 
-        # ==============================================================
-        # SHEET 1: DATA_ABBA_CLEAN_CORE (34 CỘT CHUẨN IMPORT VÀO CD CORE DATA)
-        # ==============================================================
+        # SHEET 1: DATA_ABBA_CLEAN_CORE
         ws_core = workbook.add_worksheet("Data_abba_Clean_Core")
         ws_core.set_tab_color("#1B365D")
-        ws_core.hide_gridlines(0)
-        ws_core.freeze_panes(1, 4)
+        write_cctg_data_sheet(
+            worksheet=ws_core,
+            df=df,
+            formats=formats,
+            support_decimal_price=True,
+            progress_callback=True,
+        )
 
-        font_family = "Arial"
-        fmt_header = workbook.add_format({
-            "bold": True,
-            "bg_color": "#1B365D",
-            "font_color": "#FFFFFF",
-            "font_name": font_family,
-            "font_size": 10,
-            "border": 1,
-            "border_color": "#D9D9D9",
-            "align": "center",
-            "valign": "vcenter",
-            "text_wrap": True,
-        })
-
-        fmt_left = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "left",
-            "valign": "vcenter",
-        })
-
-        fmt_center = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "center",
-            "valign": "vcenter",
-        })
-
-        fmt_curr = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "right",
-            "valign": "vcenter",
-            "num_format": "#,##0",
-        })
-
-        fmt_curr_dec = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "right",
-            "valign": "vcenter",
-            "num_format": "#,##0.00",
-        })
-
-        fmt_int = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "right",
-            "valign": "vcenter",
-            "num_format": "#,##0",
-        })
-
-        fmt_rate = workbook.add_format({
-            "font_name": font_family,
-            "font_size": 9,
-            "border": 1,
-            "border_color": "#E0E0E0",
-            "align": "right",
-            "valign": "vcenter",
-            "num_format": "0.0",
-        })
-
-        headers = list(df.columns)
-        money_cols = {"Mệnh giá", "Tổng GT HĐ mua", "Tổng GT HĐ Bán", "Lãi Coupon đã trả thực tế"}
-        int_cols = {"Số lượng", "Thời hạn nắm giữ (tháng)"}
-        rate_cols = {"LS Coupon", "Lãi suất HĐ Mua"}
-        date_cols = {"Ngày báo cáo", "Ngày phát hành AZ", "Ngày đáo hạn AZ", "Ngày mua (ngày nắm giữ)", "Ngày hết hạn nắm giữ", "Ngày bán"}
-        center_text_cols = {
-            "Số CIF", "Loại KH", "Số định danh/MST", "Mã CCTG", "Số sổ AZ", "Số FT HĐ Mua", "Số FT HĐ Bán",
-            "Số hoá đơn", "Ký hiệu hoá đơn", "Trạng thái hoá đơn", "Mã CKS HĐ Mua", "Trạng thái GD Mua",
-            "Mã CKS HĐ Bán", "Trạng thái GD Bán"
-        }
-
-        # Độ rộng cột
-        for col_idx, h in enumerate(headers):
-            w = max(len(h) + 4, 12)
-            if h in ("Số series thứ cấp", "Mã tra cứu fkey"):
-                w = 38
-            elif h in ("Số HĐ mua", "Số HĐ Bán"):
-                w = 28
-            elif h in ("Tên KH",):
-                w = 25
-            elif h in ("Tổng GT HĐ mua", "Tổng GT HĐ Bán", "Đơn giá bán/ số seri"):
-                w = 18
-            elif h in date_cols:
-                w = 15
-            ws_core.set_column(col_idx, col_idx, w)
-
-        ws_core.set_row(0, 28)
-        for col_idx, h in enumerate(headers):
-            ws_core.write(0, col_idx, h, fmt_header)
-
-        total_rows = len(df)
-        data_matrix = df.values
-        for r_idx in range(total_rows):
-            row_num = r_idx + 1
-            ws_core.set_row(row_num, 19)
-            row_raw = data_matrix[r_idx]
-
-            for col_idx, val in enumerate(row_raw):
-                h_name = headers[col_idx]
-                if not val or str(val).lower() in ("nan", "none", "null"):
-                    ws_core.write_string(row_num, col_idx, "", fmt_center if h_name in center_text_cols else fmt_left)
-                    continue
-
-                val_str = str(val).strip()
-                if h_name == "Đơn giá bán/ số seri":
-                    try:
-                        num_v = float(val_str.replace(",", ""))
-                        if num_v.is_integer():
-                            ws_core.write_number(row_num, col_idx, int(num_v), fmt_curr)
-                        else:
-                            ws_core.write_number(row_num, col_idx, num_v, fmt_curr_dec)
-                    except ValueError:
-                        ws_core.write_string(row_num, col_idx, val_str, fmt_left)
-
-                elif h_name in money_cols:
-                    try:
-                        num_v = float(val_str.replace(",", ""))
-                        ws_core.write_number(row_num, col_idx, num_v, fmt_curr)
-                    except ValueError:
-                        ws_core.write_string(row_num, col_idx, val_str, fmt_left)
-
-                elif h_name in int_cols:
-                    try:
-                        num_v = int(float(val_str.replace(",", "")))
-                        ws_core.write_number(row_num, col_idx, num_v, fmt_int)
-                    except ValueError:
-                        ws_core.write_string(row_num, col_idx, val_str, fmt_left)
-
-                elif h_name in rate_cols:
-                    try:
-                        num_v = float(val_str)
-                        ws_core.write_number(row_num, col_idx, num_v, fmt_rate)
-                    except ValueError:
-                        ws_core.write_string(row_num, col_idx, val_str, fmt_center)
-
-                elif h_name in date_cols:
-                    ws_core.write_string(row_num, col_idx, parse_date_str(val_str), fmt_center)
-
-                elif h_name in ("Số hoá đơn", "Mã CKS HĐ Mua", "Mã CKS HĐ Bán"):
-                    ws_core.write_string(row_num, col_idx, clean_int_str(val_str), fmt_center)
-
-                elif h_name in center_text_cols:
-                    ws_core.write_string(row_num, col_idx, val_str, fmt_center)
-
-                else:
-                    ws_core.write_string(row_num, col_idx, val_str, fmt_left)
-
-        ws_core.autofilter(0, 0, total_rows, len(headers) - 1)
-
-        # ==============================================================
-        # SHEET 2: CHÊNH LỆCH BÁN LẺ ĐÃ ĐIỀU CHỈNH (AUDIT TRAIL TRƯỚC VS SAU)
-        # ==============================================================
+        # SHEET 2: CHÊNH LỆCH BÁN LẺ ĐÃ ĐIỀU CHỈNH
         ws_retail = workbook.add_worksheet("Chênh Lệch Bán Lẻ Đã Điều Chỉnh")
         ws_retail.set_tab_color("#0E6251")
         ws_retail.hide_gridlines(0)
         ws_retail.freeze_panes(1, 2)
+
+        fmt_center = formats["center"]
+        fmt_left = formats["left"]
+        fmt_curr = formats["currency"]
 
         fmt_retail_hdr = workbook.add_format({
             "bold": True,
@@ -533,7 +432,7 @@ class CleanCoreDataPipeline:
             "border_color": "#E0E0E0",
             "align": "right",
             "valign": "vcenter",
-            "num_format": "#,##0;[Red]-#,##0;\"-\"",
+            "num_format": '#,##0;[Red]-#,##0;"-"',
         })
 
         fmt_diff_resolved = workbook.add_format({
@@ -546,7 +445,7 @@ class CleanCoreDataPipeline:
             "border_color": "#A2D9CE",
             "align": "right",
             "valign": "vcenter",
-            "num_format": "#,##0;[Red]-#,##0;\"0\"",
+            "num_format": '#,##0;[Red]-#,##0;"0"',
         })
 
         fmt_method = workbook.add_format({
@@ -602,7 +501,7 @@ class CleanCoreDataPipeline:
             "border_color": "#A2D9CE",
             "align": "right",
             "valign": "vcenter",
-            "num_format": "#,##0;[Red]-#,##0;\"0\"",
+            "num_format": '#,##0;[Red]-#,##0;"0"',
         })
 
         retail_headers = [
@@ -644,15 +543,12 @@ class CleanCoreDataPipeline:
             ws_retail.write(r_idx, 6, entry["ft_ban"], fmt_center)
             ws_retail.write(r_idx, 7, entry["calc_orig"], fmt_curr)
             ws_retail.write(r_idx, 8, entry["bank_amt"], fmt_curr)
-            # Công thức chênh lệch gốc: =H - I
             ws_retail.write_formula(r_idx, 9, f"=H{r_excel}-I{r_excel}", fmt_diff_orig, entry["diff_orig"])
             ws_retail.write(r_idx, 10, entry["calc_new"], fmt_curr)
-            # Công thức chênh lệch sau điều chỉnh: =K - I (kết quả bằng 0)
             ws_retail.write_formula(r_idx, 11, f"=K{r_excel}-I{r_excel}", fmt_diff_resolved, entry["diff_new"])
             ws_retail.write(r_idx, 12, entry["method"], fmt_method)
             ws_retail.write(r_idx, 13, entry["status"], fmt_status_clean)
 
-        # Dòng Tổng Cộng ở cuối bảng
         tot_r_idx = len(self.retail_audit_records) + 1
         tot_r_excel = tot_r_idx + 1
         ws_retail.set_row(tot_r_idx, 22)

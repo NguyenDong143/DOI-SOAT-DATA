@@ -7,9 +7,9 @@ echo =====================================================================
 echo.
 echo Đang nạp dữ liệu và thực thi pipeline làm sạch chuyên sâu ...
 echo 1. Khớp và nạp hóa đơn điện tử còn thiếu từ BC Hoa don.xlsx
-echo 2. Bổ sung FT Mua ngân hàng từ saoke_TK43.xlsx
+echo 2. Bổ sung FT Mua và FT Bán (các món Lỗi thanh toán) từ saoke_TK43.xlsx
 echo 3. Sửa dứt điểm xung đột HĐ 18715 Lâm Gia Phước (CIF 13558581)
-echo 4. Phân bổ chênh lệch làm tròn 264 HĐ bán lẻ vào Đơn giá bán
+echo 4. Phân bổ chênh lệch làm tròn bán lẻ vào Đơn giá bán
 echo.
 python -m app.engine.clean_core_pipeline
 if %ERRORLEVEL% EQU 0 (

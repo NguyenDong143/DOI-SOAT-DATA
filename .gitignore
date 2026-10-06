@@ -1,0 +1,43 @@
+# =====================================================================
+# Git Ignore Configuration for CCTG Reconciliation Project
+# =====================================================================
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Microsoft Office temporary / lock files
+~$*.xlsx
+~$*.xls
+~$*.csv
+*.tmp
+*.temp
+*.log
+
+# Environment & IDE
+.vscode/
+.idea/
+*.sublime-workspace
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Generated output data (Keep repo lightweight, generate on demand)
+data/output/*.xlsx
+data/output/*.csv
+!data/output/.gitkeep
